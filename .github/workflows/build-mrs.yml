@@ -1,0 +1,134 @@
+name: 构建 Mihomo MRS 规则集
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'Rule/**'
+      - 'rule/**'
+  schedule:
+    - cron: '0 20 * * *'        # ⏰ 每天北京时间凌晨 04:00 自动运行
+  workflow_dispatch:             # 保留手动运行按钮
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write            # 给予发布到 release 分支的读写权限
+
+    steps:
+      # 1. 拉取代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 下载最新版 Mihomo CLI
+      - name: Download Mihomo CLI
+        run: |
+          MIHOMO_URL=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | grep "browser_download_url" | grep "linux-amd64" | grep -v "compatible" | head -n 1 | cut -d '"' -f 4)
+          curl -L $MIHOMO_URL -o mihomo.gz
+          gunzip mihomo.gz
+          chmod +x mihomo
+
+      # 3. 全局递归扫描并智能清理、编译 MRS
+      - name: Build MRS files
+        run: |
+          mkdir -p output
+          
+          # 使用 find 递归查找所有 YAML 文件
+          mapfile -t files < <(find . -type f \( -ipath "./Rule/*" -o -ipath "./rule/*" \) \( -iname "*.yaml" -o -iname "*.yml" \))
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "❌ 错误：未找到任何 YAML 文件！"
+            exit 1
+          fi
+
+          for file in "${files[@]}"; do
+            if [ -f "$file" ]; then
+              base_name=$(basename "$file" | sed 's/\.[^.]*$//')
+              echo "----------------------------------------"
+              echo "正在处理文件: ${file}"
+
+              # 动态命名，防重名
+              if [[ "$base_name" =~ (-|_)?domain$ ]]; then
+                out_domain_name="${base_name}.mrs"
+              else
+                out_domain_name="${base_name}_domain.mrs"
+              fi
+
+              if [[ "$base_name" =~ (-|_)?ip$ ]]; then
+                out_ip_name="${base_name}.mrs"
+              else
+                out_ip_name="${base_name}_ip.mrs"
+              fi
+
+              # ==========================================
+              # --- A. 提取与清洗 域名 (Domain) 规则 ---
+              # ==========================================
+              grep -iE "DOMAIN|\+\.|^[[:space:]]*- '?[+a-zA-Z0-9_-]+\.[a-zA-Z0-9._-]+'?" "$file" \
+                | grep -vE "IP-CIDR|IP-CIDR6|payload:" \
+                | sed -E 's/^[[:space:]]*-//g' \
+                | sed -E 's/[[:space:]]*//g' \
+                | sed -E 's/DOMAIN-(SUFFIX|KEYWORD|FULL),//gi' \
+                | sed -E 's/DOMAIN,//gi' \
+                | sed "s/'//g" \
+                | sed 's/"//g' \
+                | grep -v '^$' \
+                | sed 's/^/  - /' \
+                > domain_lines.txt || true
+
+              if [ -s domain_lines.txt ]; then
+                echo "payload:" > tmp_domain.yaml
+                cat domain_lines.txt >> tmp_domain.yaml
+                
+                # 执行编译（忽略错误日志）
+                ./mihomo convert-ruleset domain yaml tmp_domain.yaml "tmp_out.mrs" 2>/dev/null || true
+                if [ -s tmp_out.mrs ]; then
+                  mv tmp_out.mrs "output/${out_domain_name}"
+                  echo "  └── 成功生成域名规则: output/${out_domain_name}"
+                fi
+                rm -f tmp_out.mrs tmp_domain.yaml
+              fi
+              rm -f domain_lines.txt
+
+              # ==========================================
+              # --- B. 提取与清洗 IP (IP-CIDR) 规则 ---
+              # ==========================================
+              grep -iE "IP-CIDR|([0-9]{1,3}\.){3}[0-9]{1,3}\/[0-9]+|[0-9a-fA-F:]+:[0-9a-fA-F:]*\/[0-9]+" "$file" \
+                | grep -vE "payload:" \
+                | sed -E 's/^[[:space:]]*-//g' \
+                | sed -E 's/[[:space:]]*//g' \
+                | sed -E 's/IP-CIDR6?,//gi' \
+                | sed "s/'//g" \
+                | sed 's/"//g' \
+                | grep -v '^$' \
+                | sed 's/^/  - /' \
+                > ip_lines.txt || true
+
+              if [ -s ip_lines.txt ]; then
+                echo "payload:" > tmp_ip.yaml
+                cat ip_lines.txt >> tmp_ip.yaml
+                
+                # 执行编译（忽略错误日志）
+                ./mihomo convert-ruleset ipcidr yaml tmp_ip.yaml "tmp_out.mrs" 2>/dev/null || true
+                if [ -s tmp_out.mrs ]; then
+                  mv tmp_out.mrs "output/${out_ip_name}"
+                  echo "  └── 成功生成 IP 规则: output/${out_ip_name}"
+                fi
+                rm -f tmp_out.mrs tmp_ip.yaml
+              fi
+              rm -f ip_lines.txt
+
+            fi
+          done
+
+      # 4. 发布编译好的 .mrs 文件到 release 分支（开启增量保留）
+      - name: Deploy to release branch
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./output
+          publish_branch: release
+          keep_files: true
+          force_orphan: false
